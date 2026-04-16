@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, LinearRegression
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
@@ -32,7 +32,7 @@ def get_characteristics(df):
 def preprocess(df, features, train_mask):
     """Preprocess with proper index handling"""
     df = df.copy()
-    df = df.reset_index(drop=True)  # Reset index to avoid alignment issues
+    df = df.reset_index(drop=True)
     
     train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
     
@@ -75,11 +75,32 @@ def preprocess(df, features, train_mask):
     return df, scaler
 
 # ============================================================================
-# GENERIC ELASTIC NET (Baseline)
+# MODEL (i): HISTORICAL AVERAGE
+# ============================================================================
+
+def historical_average(df, train_mask):
+    train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
+    stock_means = df.loc[train_indices].groupby('id')['ret_exc_lead1m'].mean()
+    overall_mean = df.loc[train_indices, 'ret_exc_lead1m'].mean()
+    df['pred_hist'] = df['id'].map(stock_means).fillna(overall_mean)
+    return df
+
+# ============================================================================
+# MODEL (ii): OLS
+# ============================================================================
+
+def ols_model(df, train_mask, features):
+    train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
+    ols = LinearRegression()
+    ols.fit(df.loc[train_indices, features], df.loc[train_indices, 'target_std'])
+    df['pred_ols'] = ols.predict(df[features].values)
+    return df
+
+# ============================================================================
+# MODEL (iii): GENERIC ELASTIC NET
 # ============================================================================
 
 def generic_elasticnet(df, train_mask, val_mask, features):
-    """Generic Elastic Net with validation tuning"""
     train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
     val_indices = val_mask.values if hasattr(val_mask, 'values') else val_mask
     
@@ -93,6 +114,7 @@ def generic_elasticnet(df, train_mask, val_mask, features):
     
     best_r2 = -np.inf
     best_model = None
+    best_params = None
     
     for alpha in alphas:
         for l1 in l1_ratios:
@@ -102,25 +124,25 @@ def generic_elasticnet(df, train_mask, val_mask, features):
             if r2 > best_r2:
                 best_r2 = r2
                 best_model = model
+                best_params = (alpha, l1)
     
-    print(f"Generic EN: alpha={best_model.alpha}, l1_ratio={best_model.l1_ratio}, val R²={best_r2:.6f}")
+    print(f"Best: alpha={best_params[0]}, l1_ratio={best_params[1]}, val R²={best_r2:.6f}")
+    print(f"Selected {np.sum(np.abs(best_model.coef_) > 1e-6)} / {len(features)} features")
     
     df['pred_enet'] = best_model.predict(df[features].values)
     return df
 
 # ============================================================================
-# ROLLING WINDOW ELASTIC NET (PIE-LASSO style)
+# MODEL (iv): ROLLING WINDOW ELASTIC NET (PIE-LASSO style)
 # ============================================================================
 
 def rolling_window_elasticnet(df, test_mask, features):
-    """Rolling window with proper index handling"""
     print("\n" + "="*60)
-    print("ROLLING WINDOW ELASTIC NET")
+    print("ROLLING WINDOW ELASTIC NET (PIE-LASSO style)")
     print("="*60)
     
     test_indices = test_mask.values if hasattr(test_mask, 'values') else test_mask
-    test_dates = df.loc[test_indices, 'eom'].unique()
-    test_dates = sorted(test_dates)
+    test_dates = sorted(df.loc[test_indices, 'eom'].unique())
     
     all_predictions = []
     selected_counts = []
@@ -136,7 +158,6 @@ def rolling_window_elasticnet(df, test_mask, features):
         if len(train_data) < 500 or len(test_data) < 50:
             preds = np.zeros(len(test_data))
         else:
-            # Standardize on rolling window
             scaler_roll = StandardScaler()
             X_train_roll = scaler_roll.fit_transform(train_data[features])
             X_test_roll = scaler_roll.transform(test_data[features])
@@ -158,73 +179,9 @@ def rolling_window_elasticnet(df, test_mask, features):
             print(f"  Month {i+1}/{len(test_dates)}: avg selected {avg_selected:.1f} features")
     
     predictions = pd.concat(all_predictions, ignore_index=True)
-    
-    # Merge back safely
     df = df.merge(predictions, on=['id', 'eom'], how='left')
     df['pred_enet_rolling'] = df['pred_enet_rolling'].fillna(0)
     
-    return df
-
-# ============================================================================
-# SEED AVERAGING (Transformer style)
-# ============================================================================
-
-def seed_averaged_elasticnet(df, train_mask, features, n_seeds=5):
-    """Average predictions across multiple seeds"""
-    print("\n" + "="*60)
-    print(f"SEED AVERAGING ({n_seeds} seeds)")
-    print("="*60)
-    
-    train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
-    
-    X_train = df.loc[train_indices, features].values
-    y_train = df.loc[train_indices, 'target_std'].values
-    
-    all_predictions = []
-    
-    for seed in range(n_seeds):
-        model = ElasticNet(alpha=0.001, l1_ratio=0.5, max_iter=10000, random_state=seed)
-        model.fit(X_train, y_train)
-        pred = model.predict(df[features].values)
-        all_predictions.append(pred)
-        print(f"  Seed {seed}: selected {np.sum(np.abs(model.coef_) > 1e-6)} features")
-    
-    # Simple average
-    df['pred_enet_seedavg'] = np.mean(all_predictions, axis=0)
-    
-    # L1 normalized average (Transformer paper)
-    normalized_preds = []
-    for pred in all_predictions:
-        pred_norm = pred / (np.sum(np.abs(pred)) + 1e-10)
-        normalized_preds.append(pred_norm)
-    df['pred_enet_seedavg_norm'] = np.mean(normalized_preds, axis=0)
-    
-    return df
-
-# ============================================================================
-# HISTORICAL AVERAGE
-# ============================================================================
-
-def historical_average(df, train_mask):
-    """Historical average benchmark"""
-    train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
-    stock_means = df.loc[train_indices].groupby('id')['ret_exc_lead1m'].mean()
-    overall_mean = df.loc[train_indices, 'ret_exc_lead1m'].mean()
-    df['pred_hist'] = df['id'].map(stock_means).fillna(overall_mean)
-    return df
-
-# ============================================================================
-# OLS
-# ============================================================================
-
-def ols_model(df, train_mask, features):
-    """OLS baseline"""
-    train_indices = train_mask.values if hasattr(train_mask, 'values') else train_mask
-    
-    from sklearn.linear_model import LinearRegression
-    ols = LinearRegression()
-    ols.fit(df.loc[train_indices, features], df.loc[train_indices, 'target_std'])
-    df['pred_ols'] = ols.predict(df[features].values)
     return df
 
 # ============================================================================
@@ -232,14 +189,12 @@ def ols_model(df, train_mask, features):
 # ============================================================================
 
 def evaluate_models(df, test_mask):
-    """Evaluate all models on test set"""
     test_indices = test_mask.values if hasattr(test_mask, 'values') else test_mask
     
     y_true = df.loc[test_indices, 'ret_exc_lead1m'].values
     y_baseline = y_true.mean()
     
-    pred_cols = ['pred_hist', 'pred_ols', 'pred_enet', 'pred_enet_rolling', 
-                 'pred_enet_seedavg', 'pred_enet_seedavg_norm']
+    pred_cols = ['pred_hist', 'pred_ols', 'pred_enet', 'pred_enet_rolling']
     
     results = []
     for col in pred_cols:
@@ -259,8 +214,7 @@ def evaluate_models(df, test_mask):
 # PORTFOLIO CONSTRUCTION
 # ============================================================================
 
-def build_portfolio(df, test_mask, pred_col):
-    """Long top decile, short bottom decile"""
+def build_portfolio(df, test_mask, pred_col, name="Portfolio"):
     test_indices = test_mask.values if hasattr(test_mask, 'values') else test_mask
     test = df.loc[test_indices].copy()
     
@@ -278,7 +232,7 @@ def build_portfolio(df, test_mask, pred_col):
             month.iloc[:decile_size, month.columns.get_loc('weight')] = 1.0 / decile_size
             month.iloc[-decile_size:, month.columns.get_loc('weight')] = -1.0 / decile_size
             
-            # L1 normalization
+            # L1 normalization (Transformer paper style)
             month['weight'] = month['weight'] / (month['weight'].abs().sum() + 1e-10)
         else:
             month['weight'] = 0.0
@@ -297,9 +251,15 @@ def build_portfolio(df, test_mask, pred_col):
     ann_vol = monthly_returns.std() * np.sqrt(12)
     sharpe = ann_return / ann_vol if ann_vol > 0 else 0
     
+    # Turnover
+    weights_wide = weights.pivot(index='eom', columns='id', values='weight').fillna(0)
+    turnover = weights_wide.diff().abs().sum(axis=1).mean() / 2
+    
+    print(f"\n{name}:")
     print(f"  Annualized Return: {ann_return:.2%}")
-    print(f"  Annualized Vol: {ann_vol:.2%}")
+    print(f"  Annualized Volatility: {ann_vol:.2%}")
     print(f"  Sharpe Ratio: {sharpe:.3f}")
+    print(f"  Monthly Turnover: {turnover:.2%}")
     
     return monthly_returns, sharpe
 
@@ -307,33 +267,42 @@ def build_portfolio(df, test_mask, pred_col):
 # MAIN
 # ============================================================================
 
-def main_enhanced():
+def main():
     print("="*70)
-    print("ENHANCED ELASTIC NET WITH FINANCE-SPECIFIC STRATEGIES")
+    print("ENHANCED ELASTIC NET PIPELINE")
+    print("Inspired by: PIE-LASSO and Kelly Transformer (2025)")
     print("="*70)
     
     # Load
-    df = load_data('jkp.data.parquet')
+    df = load_data('jkp_data.parquet')
     features = get_characteristics(df)
     
-    # Create date masks (keep as pandas Series for filtering)
-    df['eom'] = pd.to_datetime(df['eom'])
-    
+    # Split dates
     train_mask = df['eom'] <= '2015-12-31'
     val_mask = (df['eom'] > '2015-12-31') & (df['eom'] <= '2018-12-31')
     test_mask = df['eom'] > '2018-12-31'
     
     print(f"\nTrain: {train_mask.sum():,} | Val: {val_mask.sum():,} | Test: {test_mask.sum():,}")
     
-    # Preprocess (pass the boolean masks directly)
+    # Preprocess
     df, _ = preprocess(df, features, train_mask)
     
     # Models
+    print("\n" + "="*60)
+    print("TRAINING MODELS")
+    print("="*60)
+    
     df = historical_average(df, train_mask)
+    print("✓ Historical Average")
+    
     df = ols_model(df, train_mask, features)
+    print("✓ OLS")
+    
     df = generic_elasticnet(df, train_mask, val_mask, features)
+    print("✓ Generic Elastic Net")
+    
     df = rolling_window_elasticnet(df, test_mask, features)
-    df = seed_averaged_elasticnet(df, train_mask, features, n_seeds=5)
+    print("✓ Rolling Window Elastic Net (PIE-LASSO)")
     
     # Evaluate
     print("\n" + "="*70)
@@ -342,13 +311,17 @@ def main_enhanced():
     results = evaluate_models(df, test_mask)
     print(results.to_string(index=False))
     
-    # Portfolio for best model
+    # Portfolio comparison
     print("\n" + "="*70)
-    print("PORTFOLIO PERFORMANCE (Elastic Net Seed Averaged)")
+    print("PORTFOLIO PERFORMANCE COMPARISON")
     print("="*70)
-    build_portfolio(df, test_mask, 'pred_enet_seedavg')
+    
+    build_portfolio(df, test_mask, 'pred_hist', 'Historical Average')
+    build_portfolio(df, test_mask, 'pred_ols', 'OLS')
+    build_portfolio(df, test_mask, 'pred_enet', 'Generic Elastic Net')
+    build_portfolio(df, test_mask, 'pred_enet_rolling', 'Rolling Window (PIE-LASSO)')
     
     return df, results
 
 if __name__ == "__main__":
-    df, results = main_enhanced()
+    df, results = main()

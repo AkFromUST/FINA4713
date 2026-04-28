@@ -313,7 +313,7 @@ def main_enhanced():
     print("="*70)
     
     # Load
-    df = load_data('jkp.data.parquet')
+    df = load_data('jkp_data.parquet')
     features = get_characteristics(df)
     
     # Create date masks (keep as pandas Series for filtering)

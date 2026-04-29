@@ -4,5 +4,8 @@ numpy
 pandas
 matplotlib
 scikit-learn
-ipykernel
 pyarrow
+pdfplumber
+torch
+joblib
+scipy

@@ -8,3 +8,8 @@ venv/
 Proj/jkp_data.parquet
 Proj/files/
 Proj/.claude/
+
+# for the NN
+
+Proj/NN/files/
+Proj/NN/__pycache__/

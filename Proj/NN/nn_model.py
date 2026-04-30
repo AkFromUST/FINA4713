@@ -286,7 +286,12 @@ def run_nn(
         predictions  — DataFrame: test-set predictions for all architectures
         models       — dict: name → best-seed GKXNet
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     if verbose:
         print(f"\n  Device : {device}")
 

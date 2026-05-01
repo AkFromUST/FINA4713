@@ -11,5 +11,6 @@ Proj/.claude/
 
 # for the NN
 
-Proj/NN/files/
+Proj/NN/files/models/
 Proj/NN/__pycache__/
+Proj/NN/files/hunloss/models/

@@ -10,3 +10,4 @@ torch
 joblib
 scipy
 statsmodels
+tqdm

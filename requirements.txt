@@ -9,3 +9,4 @@ pdfplumber
 torch
 joblib
 scipy
+statsmodels

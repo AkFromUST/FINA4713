@@ -7,8 +7,8 @@
 
 set -e  # stop on first error
 
-PYTHON=../venv/bin/python
-STAGED=AK_data_changes/staged_run
+PYTHON=../../../venv/bin/python3
+STAGED=.
 
 echo "=========================================="
 echo "STAGE 1: Preprocessing + IC + PCA"

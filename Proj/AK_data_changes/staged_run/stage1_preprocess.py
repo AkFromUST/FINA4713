@@ -34,7 +34,7 @@ CKPT.mkdir(parents=True, exist_ok=True)
 
 # ── 1. Load data ──────────────────────────────────────────────────────────────
 print("Loading parquet...")
-df = pd.read_parquet('../jkp_data.parquet')
+df = pd.read_parquet('../../jkp_data.parquet')
 print(f"  Shape: {df.shape}")
 
 df['log_me'] = np.log1p(df['me'].clip(lower=0))

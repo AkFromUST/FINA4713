@@ -16,3 +16,7 @@ Proj/NN/files/models/
 Proj/NN/__pycache__/
 Proj/NN/files/
 Proj/NN/__pycache__/
+
+Proj/AK_data_changes/files/
+Proj/AK_data_changes/staged_run/AK_data_changes/files/
+Proj/AK_data_changes/staged_run/__pycache__/

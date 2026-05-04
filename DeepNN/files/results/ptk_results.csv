@@ -1,2 +1,2 @@
-model,oos_r2_test,cagr,ann_ret,ann_vol,sharpe,sortino,max_drawdown,calmar,hit_rate,n_months,hidden_dim,epochs,lr,rolling_window,ridge_penalty
-ptk_sdf,-0.900179,-0.08045978745091431,-0.07489110034615226,0.13011085726986754,-0.57559455004449,-0.6387964526582428,-0.44277895455968125,-0.1817154736519197,0.4225352112676056,71,64,20,0.001,24,0.0001
+model,oos_r2_test,sharpe_oos_sdf,sharpe_is_sdf,cagr,ann_ret,ann_vol,sharpe,sortino,max_drawdown,calmar,hit_rate,n_months,n_ptk_factors,n_factor_dim,hidden_dim,epochs,lr,rolling_window,ridge_penalty
+ptk_sdf,-0.000139,-0.44,0.23,-0.018847029563067053,-0.01544846401168841,0.08412568179239126,-0.1836355282066272,-0.2126218170209486,-0.16085029779860577,-0.11717124444907566,0.5211267605633803,71,144,10241,64,20,0.001,24,0.0001

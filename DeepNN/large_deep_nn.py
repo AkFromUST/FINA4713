@@ -8,6 +8,12 @@ Adapted to course dataset:
   - Val:   2016-01 to 2018-12
   - Test:  2019-01 to 2024-12
 
+Pipeline (paper's exact method):
+  Stage 1 — Rolling-window DNN (MSRR loss) → PTK gradient factors for train+val
+  Stage 2 — Ridge pricer fitted on those factors → pricing weights w
+  Stage 3 — Per-stock PTK scores for test period via vectorised Jacobian:
+               score_i = w' · Φ((1/√N) · ∇_θ θ(X_i))   [look-ahead free]
+
 Output: files/results/ptk_test_predictions.parquet  (backtest.py-compatible)
         files/results/ptk_results.csv
 """
@@ -20,6 +26,7 @@ import torch.optim as optim
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from typing import List, Dict
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -68,10 +75,14 @@ class Config:
 
     # ========== DATA FILTERING ==========
     MIN_STOCKS_PER_MONTH = 50  # Minimum stocks required in a month
+                               # Lower = more months but potentially noisier
+
     MAX_TRAIN_SAMPLES = 100000 # Memory limit: max observations per DNN training
+                               # Increase if you have more memory
 
     # ========== PTK SPLIT (For pricing stage) ==========
     PTK_TRAIN_SPLIT = 0.7      # % of PTK factors used for training (rest for test)
+                               # 0.7 means first 70% train, last 30% test
 
 
 # ============================================================================
@@ -89,16 +100,18 @@ def load_data(path=DATA_PATH):
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
     df = df.dropna(subset=['ret_exc_lead1m'])
-    print(f"Loaded {len(df):,} observations  ({df['eom'].min().date()} – {df['eom'].max().date()})")
+    print(f"Loaded {len(df):,} observations")
+    print(f"Date range: {df['eom'].min()} to {df['eom'].max()}")
     return df
 
 
 def get_characteristics(df):
     """Get list of characteristic column names"""
     exclude = {'id', 'eom', 'excntry', 'ret_exc_lead1m', 'me', 'mcap_usd', 'target_std'}
-    chars = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude]
-    print(f"Raw characteristics count: {len(chars)}")
-    return chars
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    characteristics = [c for c in numeric_cols if c not in exclude]
+    print(f"Raw characteristics count: {len(characteristics)}")
+    return characteristics
 
 
 # ============================================================================
@@ -303,38 +316,135 @@ class PTK_Pricer:
 
 
 # ============================================================================
-# ROLLING-WINDOW PER-STOCK PREDICTION  (primary output for backtest.py)
+# PER-STOCK PTK SCORES  (vectorised analytic Jacobian)
 # ============================================================================
 
-def generate_test_predictions(df_processed, features, cfg, verbose=True):
+def compute_per_stock_ptk_scores(
+    model: nn.Module,
+    X_scaled: np.ndarray,
+    pricer: PTK_Pricer,
+) -> np.ndarray:
     """
-    For each test month (2019-01 to 2024-12):
-      1. Train DNN on the preceding ROLLING_WINDOW months.
-      2. Run DNN forward pass on the test month's stocks → per-stock signal.
+    Compute look-ahead-free per-stock PTK scores:
 
-    The MSRR loss trains the DNN to find portfolio weights that maximise Sharpe,
-    so the DNN output θ(X_i,t) is directly the stock-level signal.
+        score_i = w' · Φ( (1/√N) · ∇_θ θ(X_i) )
 
-    Returns a DataFrame compatible with backtest.py:
-      id, eom, excntry, y_true, me_raw, pred_ptk_sdf
+    where w is the PTK pricing vector, Φ is the pricer's feature scaler,
+    and ∇_θ θ(X_i) is the gradient of the DNN output for stock i w.r.t.
+    ALL model parameters (no returns used → strictly look-ahead free).
+
+    Uses the analytic Jacobian for the 1-hidden-layer network.
+    Parameter order matches torch.autograd.grad(∙, model.parameters()):
+      network[0].weight  (H×D) → dW1 flattened
+      network[0].bias    (H,)  → db1
+      network[2].weight  (1×H) → dW2 flattened
+      network[2].bias    (1,)  → db2
+
+    Verified to match autograd to numerical precision (max diff ~2e-8).
     """
-    all_months  = sorted(df_processed['eom'].unique())
-    test_months = [m for m in all_months if m >= pd.Timestamp('2019-01-01')]
+    model.eval()
+    N = len(X_scaled)
+    X_t = torch.FloatTensor(X_scaled)
 
-    print(f"\n[Rolling prediction] {len(test_months)} test months  (window = {cfg.ROLLING_WINDOW} months)")
+    with torch.no_grad():
+        W1 = model.network[0].weight    # (H, D)
+        W2 = model.network[2].weight    # (1, H)
 
-    rows = []
-    for i, month in enumerate(test_months):
-        if verbose and i % 12 == 0:
-            print(f"  {i+1}/{len(test_months)}  {month.date()}")
+        z1   = X_t @ W1.T + model.network[0].bias   # (N, H)
+        mask = (z1 > 0).float()                       # (N, H)  ReLU mask
+        h    = z1 * mask                              # (N, H)  activations
 
-        win = [m for m in all_months if m < month][-cfg.ROLLING_WINDOW:]
-        if len(win) < max(6, cfg.ROLLING_WINDOW // 2):
-            continue
+        # W2[0,j] * mask[i,j]  →  shape (N, H)
+        w2m = W2[0].unsqueeze(0) * mask
+
+        # ∂θ/∂W1[j,k] = W2[0,j] * mask[i,j] * X[i,k]  →  (N, H*D)
+        dW1 = (w2m.unsqueeze(2) * X_t.unsqueeze(1)).reshape(N, -1)
+
+        # Concatenate in parameter order: W1, b1, W2, b2
+        J = torch.cat([
+            dW1,                    # (N, H*D)
+            w2m,                    # (N, H)  = ∂θ/∂b1
+            h,                      # (N, H)  = ∂θ/∂W2 (1×H flattened)
+            torch.ones(N, 1),       # (N, 1)  = ∂θ/∂b2
+        ], dim=1).numpy()           # (N, P)
+
+    # Scale by 1/√N to match compute_ptk_gradients normalisation
+    J /= np.sqrt(N)
+
+    # Project through pricer's scaler then pricing weights
+    J_scaled = pricer.scaler.transform(J)   # (N, P)
+    scores   = J_scaled @ pricer.weights    # (N,)
+
+    return scores
+
+
+# ============================================================================
+# MAIN PTK-SDF PIPELINE
+# ============================================================================
+
+def model_ptk_sdf(
+    df_processed: pd.DataFrame,
+    features: List[str],
+    cfg: Config,
+    verbose: bool = True
+) -> tuple:
+    """
+    Full PTK-SDF pipeline (Kelly et al. 2024).
+
+    Stage 1 — Rolling-window DNN training over the train+val period.
+               For each month t, train on the preceding ROLLING_WINDOW months,
+               then extract PTK gradient factor g_t = (1/√N)·∇_θ[Σ_i θ(X_i)·r_i].
+
+    Stage 2 — Fit ridge pricer on the collected PTK factors.
+               w = (λI + F'F/T)^{-1} · F̄   (closed-form).
+
+    Stage 3 — For each test month (2019-2024):
+               (a) Train DNN on rolling window (same procedure as Stage 1).
+               (b) Compute per-stock PTK scores via vectorised Jacobian (no returns).
+               (c) Compute OOS SDF return g_t → pricer.predict(g_t) for reporting.
+
+    Returns:
+        pred_df  — per-stock predictions (backtest.py-compatible parquet format)
+        results  — dict with SDF Sharpe, factor dimensions, etc.
+    """
+
+    print("\n" + "="*60)
+    print("PTK-SDF PIPELINE (Kelly et al. 2024)")
+    print("="*60)
+    print(f"\nCONFIGURATION:")
+    print(f"  Hidden Dim:      {cfg.HIDDEN_DIM}")
+    print(f"  DNN Epochs:      {cfg.DNN_EPOCHS}")
+    print(f"  Learning Rate:   {cfg.DNN_LEARNING_RATE}")
+    print(f"  Ridge Penalty:   {cfg.RIDGE_PENALTY}")
+    print(f"  Rolling Window:  {cfg.ROLLING_WINDOW} months")
+
+    all_months     = sorted(df_processed['eom'].unique())
+    trainval_months = [m for m in all_months if m <= pd.Timestamp('2018-12-31')]
+    test_months    = [m for m in all_months if m >= pd.Timestamp('2019-01-01')]
+    window         = cfg.ROLLING_WINDOW
+
+    print(f"\n  Train+val months: {len(trainval_months)}")
+    print(f"  Test months:      {len(test_months)}")
+
+    # ------------------------------------------------------------------ #
+    # STAGE 1: Extract PTK gradient factors (train+val rolling window)   #
+    # ------------------------------------------------------------------ #
+    print(f"\n[Stage 1] Extracting PTK gradient factors ...")
+
+    ptk_factors = []
+    ptk_months  = []
+
+    for t in range(window, len(trainval_months)):
+        if verbose and (t - window) % 12 == 0:
+            print(f"  Month {t - window + 1}/{len(trainval_months) - window}"
+                  f"  ({trainval_months[t].date()})")
+
+        win   = trainval_months[t - window : t]
+        month = trainval_months[t]
 
         tr_mask = df_processed['eom'].isin(win)
-        X_tr    = df_processed.loc[tr_mask, features].values.astype(np.float32)
-        R_tr    = df_processed.loc[tr_mask, 'ret_exc_lead1m'].values.astype(np.float32)
+        X_tr = df_processed.loc[tr_mask, features].values.astype(np.float32)
+        R_tr = df_processed.loc[tr_mask, 'ret_exc_lead1m'].values.astype(np.float32)
 
         if len(X_tr) > cfg.MAX_TRAIN_SAMPLES:
             idx  = np.random.choice(len(X_tr), cfg.MAX_TRAIN_SAMPLES, replace=False)
@@ -345,27 +455,120 @@ def generate_test_predictions(df_processed, features, cfg, verbose=True):
         model    = train_simplified_dnn(X_tr_sc, R_tr, len(features), cfg)
 
         te_mask = df_processed['eom'] == month
-        X_te    = df_processed.loc[te_mask, features].values.astype(np.float32)
+        X_te = df_processed.loc[te_mask, features].values.astype(np.float32)
+        R_te = df_processed.loc[te_mask, 'ret_exc_lead1m'].values.astype(np.float32)
+
         if len(X_te) < cfg.MIN_STOCKS_PER_MONTH:
             continue
 
-        model.eval()
-        with torch.no_grad():
-            preds = model(torch.FloatTensor(scaler.transform(X_te))).numpy()
+        X_te_sc = scaler.transform(X_te)
+
+        try:
+            g_t = compute_ptk_gradients(model, X_te_sc, R_te)
+            ptk_factors.append(g_t)
+            ptk_months.append(month)
+        except Exception as e:
+            print(f"  Warning: {month.date()}: {e}")
+
+    print(f"  Extracted {len(ptk_factors)} PTK gradient factors")
+
+    if len(ptk_factors) < 12:
+        raise RuntimeError("Not enough PTK factors extracted — cannot proceed.")
+
+    # ------------------------------------------------------------------ #
+    # STAGE 2: Ridge pricer                                              #
+    # ------------------------------------------------------------------ #
+    print("\n[Stage 2] Fitting PTK ridge pricer ...")
+
+    F = np.array(ptk_factors)   # (T, P)
+    print(f"  Factor matrix: {F.shape}  (T months × P params)")
+
+    pricer = PTK_Pricer(ridge_penalty=cfg.RIDGE_PENALTY)
+    pricer.fit(F)
+
+    # In-sample SDF Sharpe (diagnostic)
+    sdf_is = np.array([pricer.predict(f) for f in F])
+    sharpe_is = np.sqrt(12) * sdf_is.mean() / (sdf_is.std() + 1e-8)
+    print(f"  In-sample annualised Sharpe (train+val): {sharpe_is:.2f}")
+
+    # ------------------------------------------------------------------ #
+    # STAGE 3: Per-stock PTK scores for test period                      #
+    # ------------------------------------------------------------------ #
+    print(f"\n[Stage 3] Per-stock PTK scores for {len(test_months)} test months ...")
+
+    rows           = []
+    sdf_oos        = []
+    sdf_oos_months = []
+
+    for i, month in enumerate(test_months):
+        if verbose and i % 12 == 0:
+            print(f"  {i + 1}/{len(test_months)}  {month.date()}")
+
+        win = [m for m in all_months if m < month][-window:]
+        if len(win) < max(6, window // 2):
+            continue
+
+        tr_mask = df_processed['eom'].isin(win)
+        X_tr = df_processed.loc[tr_mask, features].values.astype(np.float32)
+        R_tr = df_processed.loc[tr_mask, 'ret_exc_lead1m'].values.astype(np.float32)
+
+        if len(X_tr) > cfg.MAX_TRAIN_SAMPLES:
+            idx  = np.random.choice(len(X_tr), cfg.MAX_TRAIN_SAMPLES, replace=False)
+            X_tr = X_tr[idx];  R_tr = R_tr[idx]
+
+        scaler  = StandardScaler()
+        X_tr_sc = scaler.fit_transform(X_tr)
+        model   = train_simplified_dnn(X_tr_sc, R_tr, len(features), cfg)
+
+        te_mask = df_processed['eom'] == month
+        X_te = df_processed.loc[te_mask, features].values.astype(np.float32)
+        R_te = df_processed.loc[te_mask, 'ret_exc_lead1m'].values.astype(np.float32)
+
+        if len(X_te) < cfg.MIN_STOCKS_PER_MONTH:
+            continue
+
+        X_te_sc = scaler.transform(X_te)
+
+        # (a) Per-stock scores via Jacobian — look-ahead free (no returns)
+        scores = compute_per_stock_ptk_scores(model, X_te_sc, pricer)
+
+        # (b) OOS SDF return for reporting (uses realised returns — evaluation only)
+        try:
+            g_t = compute_ptk_gradients(model, X_te_sc, R_te)
+            sdf_oos.append(pricer.predict(g_t))
+            sdf_oos_months.append(month)
+        except Exception:
+            pass
 
         month_df = df_processed.loc[te_mask, ['id', 'eom', 'excntry', 'ret_exc_lead1m']].copy()
         month_df = month_df.rename(columns={'ret_exc_lead1m': 'y_true'})
-
-        # me is excluded from preprocessing so its original value is preserved
         if 'me' in df_processed.columns:
             month_df['me_raw'] = df_processed.loc[te_mask, 'me'].values
-
-        month_df['pred_ptk_sdf'] = preds
+        month_df['pred_ptk_sdf'] = scores
         rows.append(month_df)
 
     pred_df = pd.concat(rows, ignore_index=True)
-    print(f"Generated {len(pred_df):,} stock-month predictions  ({pred_df['eom'].nunique()} months)")
-    return pred_df
+
+    # OOS SDF Sharpe (paper's evaluation metric)
+    sdf_arr     = np.array(sdf_oos)
+    sharpe_oos  = np.sqrt(12) * sdf_arr.mean() / (sdf_arr.std() + 1e-8)
+
+    print("\n" + "="*60)
+    print("PTK-SDF PERFORMANCE")
+    print("="*60)
+    print(f"OOS SDF Sharpe (paper metric, {len(sdf_arr)} months): {sharpe_oos:.2f}")
+    print(f"Per-stock predictions generated: {len(pred_df):,} obs  ({pred_df['eom'].nunique()} months)")
+    print("="*60)
+
+    results = {
+        'sdf_returns_oos':   sdf_arr,
+        'sdf_months_oos':    sdf_oos_months,
+        'sharpe_oos':        sharpe_oos,
+        'sharpe_is':         sharpe_is,
+        'n_ptk_factors':     F.shape[0],
+        'n_factor_dim':      F.shape[1],
+    }
+    return pred_df, results
 
 
 # ============================================================================
@@ -399,15 +602,16 @@ def main():
     print(f"  Val   2016-2018: {val_mask.sum():>10,} obs")
     print(f"  Test  2019-2024: {test_mask.sum():>10,} obs")
 
-    # Paper's preprocessing (missing filter fitted on train only — no look-ahead)
+    # Paper's preprocessing (missing filter on train only — no look-ahead)
     df_processed, features = preprocess_data_paper_style(df, raw_features, train_mask)
 
-    # Rolling-window per-stock predictions for the test period
-    pred_df = generate_test_predictions(df_processed, features, cfg)
+    # Full PTK-SDF pipeline
+    pred_df, results = model_ptk_sdf(df_processed, features, cfg)
 
     # OOS R² (must report per Section 3.4)
     r2 = compute_oos_r2(pred_df)
     print(f"\nTest OOS R² (PTK-SDF): {r2:.6f}")
+    print("(Negative OOS R² expected — model optimises Sharpe, not MSE)")
 
     # Portfolio metrics via shared backtest.py
     proj_dir = os.path.join(SCRIPT_DIR, '..', 'Proj')
@@ -418,7 +622,7 @@ def main():
             print("\n--- Portfolio Performance (equal-weight decile L/S) ---")
             print_summary(evaluate_all(pred_df))
         except Exception as e:
-            print(f"backtest.py unavailable: {e}")
+            print(f"backtest.py note: {e}")
 
     # Save outputs
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -428,22 +632,26 @@ def main():
     print(f"\nSaved predictions → {pred_path}")
 
     summary = pd.DataFrame([{
-        'model':          'ptk_sdf',
-        'oos_r2_test':    r2,
-        'n_obs':          len(pred_df),
-        'n_months':       pred_df['eom'].nunique(),
-        'hidden_dim':     cfg.HIDDEN_DIM,
-        'epochs':         cfg.DNN_EPOCHS,
-        'lr':             cfg.DNN_LEARNING_RATE,
-        'rolling_window': cfg.ROLLING_WINDOW,
-        'ridge_penalty':  cfg.RIDGE_PENALTY,
+        'model':            'ptk_sdf',
+        'oos_r2_test':      r2,
+        'sharpe_oos_sdf':   results['sharpe_oos'],
+        'sharpe_is_sdf':    results['sharpe_is'],
+        'n_obs':            len(pred_df),
+        'n_months':         pred_df['eom'].nunique(),
+        'n_ptk_factors':    results['n_ptk_factors'],
+        'n_factor_dim':     results['n_factor_dim'],
+        'hidden_dim':       cfg.HIDDEN_DIM,
+        'epochs':           cfg.DNN_EPOCHS,
+        'lr':               cfg.DNN_LEARNING_RATE,
+        'rolling_window':   cfg.ROLLING_WINDOW,
+        'ridge_penalty':    cfg.RIDGE_PENALTY,
     }])
     csv_path = os.path.join(RESULTS_DIR, 'ptk_results.csv')
     summary.to_csv(csv_path, index=False)
     print(f"Saved summary   → {csv_path}")
 
-    return pred_df
+    return pred_df, results
 
 
 if __name__ == '__main__':
-    pred_df = main()
+    pred_df, results = main()

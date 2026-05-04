@@ -54,7 +54,7 @@ PCA_VAR_THRESH   = 0.90   # variance explained per PCA group
 MIN_STOCKS_IC    = 50     # minimum cross-section size for monthly IC
 
 # GKX NN3
-BATCH_SIZE   = 2048
+BATCH_SIZE   = 1024
 LR           = 0.001
 LAMBDA_L1    = 1e-5
 PATIENCE     = 5

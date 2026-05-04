@@ -11,6 +11,11 @@ Proj/.claude/
 
 # for the NN
 
+<<<<<<< HEAD
 Proj/NN/files/models/
 Proj/NN/__pycache__/
 Proj/NN/files/hunloss/models/
+=======
+Proj/NN/files/
+Proj/NN/__pycache__/
+>>>>>>> origin/tyler

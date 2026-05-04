@@ -1,0 +1,11 @@
+jupyter
+ipykernel
+numpy
+pandas
+matplotlib
+scikit-learn
+pyarrow
+pdfplumber
+torch
+joblib
+scipy

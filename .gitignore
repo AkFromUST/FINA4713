@@ -1,0 +1,15 @@
+venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+.vscode/
+
+# for the proj
+Proj/jkp_data.parquet
+Proj/files/
+Proj/.claude/
+
+# for the NN
+
+Proj/NN/files/
+Proj/NN/__pycache__/

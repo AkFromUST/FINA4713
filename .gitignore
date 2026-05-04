@@ -6,16 +6,13 @@ venv/
 
 # for the proj
 Proj/jkp_data.parquet
+Proj/jkp_data_slim.parquet
 Proj/files/
 Proj/.claude/
 
 # for the NN
 
-<<<<<<< HEAD
 Proj/NN/files/models/
 Proj/NN/__pycache__/
-Proj/NN/files/hunloss/models/
-=======
 Proj/NN/files/
 Proj/NN/__pycache__/
->>>>>>> origin/tyler
